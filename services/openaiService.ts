@@ -8,6 +8,9 @@ declare const process: {
 
 const OPENAI_API_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_MODEL = 'gpt-5.4-mini';
+const OPENAI_FAST_MODEL = 'gpt-5.4-nano';
+
+type OpenAIReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 
 type OpenAITextResponse = {
   output_text?: string;
@@ -109,32 +112,66 @@ const mapOpenAIError = async (response: Response) => {
 const createMessages = (instructions: string, userPrompt: string) => [
   {
     role: 'system',
-    content: instructions,
+    content: [{ type: 'input_text', text: instructions }],
   },
   {
     role: 'user',
-    content: userPrompt,
+    content: [{ type: 'input_text', text: userPrompt }],
   },
 ];
 
 const callOpenAIText = async (
   instructions: string,
   userPrompt: string,
-  options?: { maxOutputTokens?: number },
+  options?: {
+    maxOutputTokens?: number;
+    model?: string;
+    timeoutMs?: number;
+    reasoningEffort?: OpenAIReasoningEffort;
+  },
 ) => {
   // TODO: Move OpenAI calls to a secure backend before production release.
-  const response = await fetch(OPENAI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${getApiKey()}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: createMessages(instructions, userPrompt),
-      max_output_tokens: options?.maxOutputTokens ?? 220,
-    }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options?.timeoutMs ?? 14_000);
+
+  let response: Response;
+
+  try {
+    response = await fetch(OPENAI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getApiKey()}`,
+      },
+      body: JSON.stringify({
+        model: options?.model ?? OPENAI_MODEL,
+        input: createMessages(instructions, userPrompt),
+        max_output_tokens: options?.maxOutputTokens ?? 220,
+        store: false,
+        text: {
+          format: {
+            type: 'text',
+          },
+        },
+        reasoning: {
+          effort: options?.reasoningEffort ?? 'low',
+        },
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeout);
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new OpenAIServiceError(
+        'AI отвечает слишком долго. Проверьте интернет и попробуйте ещё раз.',
+      );
+    }
+
+    throw new OpenAIServiceError('Не удалось связаться с OpenAI. Проверьте интернет и ключ API.');
+  }
+
+  clearTimeout(timeout);
 
   if (!response.ok) {
     throw await mapOpenAIError(response);
@@ -156,25 +193,50 @@ const callOpenAIJson = async <T>(
   schema: Record<string, unknown>,
 ) => {
   // TODO: Move OpenAI calls to a secure backend before production release.
-  const response = await fetch(OPENAI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${getApiKey()}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: createMessages(instructions, userPrompt),
-      max_output_tokens: 500,
-      text: {
-        format: {
-          type: 'json_schema',
-          strict: true,
-          schema,
-        },
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 18_000);
+
+  let response: Response;
+
+  try {
+    response = await fetch(OPENAI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getApiKey()}`,
       },
-    }),
-  });
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        input: createMessages(instructions, userPrompt),
+        max_output_tokens: 500,
+        store: false,
+        reasoning: {
+          effort: 'low',
+        },
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'structured_response',
+            strict: true,
+            schema,
+          },
+        },
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeout);
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new OpenAIServiceError(
+        'AI отвечает слишком долго. Проверьте интернет и попробуйте ещё раз.',
+      );
+    }
+
+    throw new OpenAIServiceError('Не удалось связаться с OpenAI. Проверьте интернет и ключ API.');
+  }
+
+  clearTimeout(timeout);
 
   if (!response.ok) {
     throw await mapOpenAIError(response);
@@ -239,7 +301,12 @@ export async function generateMatchExplanation(
     2,
   )}\n\nСобытие:\n${JSON.stringify(serializeEvent(event), null, 2)}\n\nОбъясни, почему событие подходит этому волонтёру.`;
 
-  return callOpenAIText(instructions, userPrompt, { maxOutputTokens: 120 });
+  return callOpenAIText(instructions, userPrompt, {
+    maxOutputTokens: 90,
+    model: OPENAI_FAST_MODEL,
+    timeoutMs: 9_000,
+    reasoningEffort: 'none',
+  });
 }
 
 export async function answerEventQuestion(event: EventItem, question: string): Promise<string> {
@@ -248,7 +315,12 @@ export async function answerEventQuestion(event: EventItem, question: string): P
 
   const userPrompt = `Контекст события:\n${JSON.stringify(serializeEvent(event), null, 2)}\n\nВопрос пользователя:\n${question.trim()}`;
 
-  return callOpenAIText(instructions, userPrompt, { maxOutputTokens: 180 });
+  return callOpenAIText(instructions, userPrompt, {
+    maxOutputTokens: 150,
+    model: OPENAI_FAST_MODEL,
+    timeoutMs: 12_000,
+    reasoningEffort: 'low',
+  });
 }
 
 export async function improveEventDescription(input: {

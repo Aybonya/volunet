@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -22,7 +22,7 @@ import CreateEventScreen from './CreateEventScreen';
 import CreateAnnouncementScreen from './CreateAnnouncementScreen';
 import OrganizationProfileScreen from './OrganizationProfileScreen';
 import VolunteerProfileScreen from './VolunteerProfileScreen';
-import { getCurrentUser } from '../services/authService';
+import { getCurrentUser, logout } from '../services/authService';
 import {
   FALLBACK_EVENT_IMAGE,
   joinEvent,
@@ -387,8 +387,10 @@ export default function EventsFeedScreen({
   const [selectedAiEvent, setSelectedAiEvent] = useState<EventItem | null>(null);
   const [aiQuestion, setAiQuestion] = useState('');
   const [aiAnswer, setAiAnswer] = useState('');
+  const [displayedAiAnswer, setDisplayedAiAnswer] = useState('');
   const [aiAnswerError, setAiAnswerError] = useState<string | null>(null);
   const [isAiAnswering, setIsAiAnswering] = useState(false);
+  const [aiAnswerHighlighted, setAiAnswerHighlighted] = useState(false);
   const [matchDecisions, setMatchDecisions] = useState<Record<string, 'like' | 'dislike'>>({});
   const [matchDecisionLoadingId, setMatchDecisionLoadingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -396,11 +398,14 @@ export default function EventsFeedScreen({
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showAnnouncementCenter, setShowAnnouncementCenter] = useState(false);
   const [showAnnouncementComposer, setShowAnnouncementComposer] = useState(false);
+  const [showMenuDrawer, setShowMenuDrawer] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [selectedAnnouncementEvent, setSelectedAnnouncementEvent] = useState<EventItem | null>(null);
   const [joiningEventId, setJoiningEventId] = useState<string | null>(null);
   const [removingParticipationId, setRemovingParticipationId] = useState<string | null>(null);
   const [expandedOrganizationEventIds, setExpandedOrganizationEventIds] = useState<string[]>([]);
   const [now, setNow] = useState(() => new Date());
+  const aiModalScrollRef = useRef<ScrollView | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -552,59 +557,103 @@ export default function EventsFeedScreen({
   }, []);
 
   useEffect(() => {
-    if (currentUserRole !== 'volunteer' || activeTab !== 'match' || !volunteerProfile) {
+    if (
+      currentUserRole !== 'volunteer' ||
+      activeTab !== 'match' ||
+      !volunteerProfile
+    ) {
       return;
     }
 
-    const targets = [...events]
+    const availableMatchEvents = [...events]
       .map((event) => ({
         event,
         score: calculateVolunteerEventMatchScore(volunteerProfile, event),
       }))
-      .sort((left, right) => right.score - left.score)
-      .map((item) => item.event)
-      .slice(0, 6)
-      .filter(
-        (event) =>
-          !matchExplanations[event.id] &&
-          !matchExplanationErrors[event.id] &&
-          !loadingMatchIds.includes(event.id),
-      );
+      .filter(({ event, score }) => (score > 0 || event.isPopular || event.isRecommended) && !matchDecisions[event.id])
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
 
-    if (targets.length === 0) {
+        const leftDate = toMaybeDate(left.event.createdAt)?.getTime() ?? 0;
+        const rightDate = toMaybeDate(right.event.createdAt)?.getTime() ?? 0;
+        return rightDate - leftDate;
+      })
+      .map((item) => item.event)
+      .slice(0, 2);
+
+    const target = availableMatchEvents[0];
+
+    if (!target) {
+      return;
+    }
+
+    if (
+      matchExplanations[target.id] ||
+      matchExplanationErrors[target.id] ||
+      loadingMatchIds.includes(target.id)
+    ) {
       return;
     }
 
     let cancelled = false;
-    const targetIds = targets.map((event) => event.id);
-    setLoadingMatchIds((current) => Array.from(new Set([...current, ...targetIds])));
+    setLoadingMatchIds((current) => Array.from(new Set([...current, target.id])));
 
     const run = async () => {
-      await Promise.all(
-        targets.map(async (event) => {
-          try {
-            const explanation = await generateMatchExplanation(volunteerProfile, event);
+      try {
+        const explanation = await generateMatchExplanation(volunteerProfile, target);
 
-            if (!cancelled) {
-              setMatchExplanations((current) => ({ ...current, [event.id]: explanation }));
-            }
-          } catch (serviceError) {
-            if (!cancelled) {
-              setMatchExplanationErrors((current) => ({
-                ...current,
-                [event.id]:
-                  serviceError instanceof Error
-                    ? serviceError.message
-                    : 'Не удалось получить AI-объяснение мэтча.',
-              }));
-            }
-          } finally {
-            if (!cancelled) {
-              setLoadingMatchIds((current) => current.filter((id) => id !== event.id));
-            }
-          }
-        }),
-      );
+        if (!cancelled) {
+          setMatchExplanations((current) => ({ ...current, [target.id]: explanation }));
+        }
+      } catch (serviceError) {
+        if (!cancelled) {
+          setMatchExplanationErrors((current) => ({
+            ...current,
+            [target.id]:
+              serviceError instanceof Error
+                ? serviceError.message
+                : 'Не удалось получить AI-объяснение мэтча.',
+          }));
+        }
+      } finally {
+        setLoadingMatchIds((current) => current.filter((id) => id !== target.id));
+      }
+
+      const nextTarget = availableMatchEvents[1];
+
+      if (
+        cancelled ||
+        !nextTarget ||
+        matchExplanations[nextTarget.id] ||
+        matchExplanationErrors[nextTarget.id] ||
+        loadingMatchIds.includes(nextTarget.id)
+      ) {
+        return;
+      }
+
+      setLoadingMatchIds((current) => Array.from(new Set([...current, nextTarget.id])));
+
+      try {
+        const nextExplanation = await generateMatchExplanation(volunteerProfile, nextTarget);
+
+        if (!cancelled) {
+          setMatchExplanations((current) => ({ ...current, [nextTarget.id]: nextExplanation }));
+        }
+      } catch (serviceError) {
+        if (!cancelled) {
+          setMatchExplanationErrors((current) => ({
+            ...current,
+            [nextTarget.id]:
+              serviceError instanceof Error
+                ? serviceError.message
+                : 'Не удалось получить AI-объяснение мэтча.',
+          }));
+        }
+      } finally {
+        setLoadingMatchIds((current) => current.filter((id) => id !== nextTarget.id));
+      }
     };
 
     void run();
@@ -616,7 +665,7 @@ export default function EventsFeedScreen({
     activeTab,
     currentUserRole,
     events,
-    loadingMatchIds,
+    matchDecisions,
     matchExplanationErrors,
     matchExplanations,
     volunteerProfile,
@@ -663,44 +712,83 @@ export default function EventsFeedScreen({
     [matchDecisions, recommendedEvents],
   );
   const currentMatchEvent = remainingMatchEvents[0] ?? null;
-  const seenMatchCount = recommendedEvents.length - remainingMatchEvents.length;
+  const currentMatchExplanation = currentMatchEvent ? matchExplanations[currentMatchEvent.id] ?? '' : '';
 
   useEffect(() => {
     const currentEventId = currentMatchEvent?.id;
 
-    if (!currentEventId) {
+    if (!currentEventId || !currentMatchExplanation) {
       return;
     }
 
-    const fullText = matchExplanations[currentEventId];
-
-    if (!fullText) {
-      return;
-    }
-
-    const currentText = displayedMatchExplanations[currentEventId] ?? '';
-
-    if (currentText === fullText) {
-      return;
-    }
+    setDisplayedMatchExplanations((current) => ({
+      ...current,
+      [currentEventId]: '',
+    }));
 
     let frame = 0;
     const timer = setInterval(() => {
-      frame += 4;
-      const nextText = fullText.slice(0, frame);
+      frame += 5;
+      const nextText = currentMatchExplanation.slice(0, frame);
 
       setDisplayedMatchExplanations((current) => ({
         ...current,
         [currentEventId]: nextText,
       }));
 
-      if (nextText.length >= fullText.length) {
+      if (nextText.length >= currentMatchExplanation.length) {
         clearInterval(timer);
       }
     }, 18);
 
     return () => clearInterval(timer);
-  }, [currentMatchEvent?.id, displayedMatchExplanations, matchExplanations]);
+  }, [currentMatchEvent?.id, currentMatchExplanation]);
+
+  useEffect(() => {
+    if (!showAiQuestionModal || !displayedAiAnswer) {
+      return;
+    }
+
+    const scrollTimer = setTimeout(() => {
+      aiModalScrollRef.current?.scrollToEnd({ animated: true });
+    }, 180);
+
+    return () => clearTimeout(scrollTimer);
+  }, [displayedAiAnswer, showAiQuestionModal]);
+
+  useEffect(() => {
+    if (!aiAnswer) {
+      setDisplayedAiAnswer('');
+      return;
+    }
+
+    setDisplayedAiAnswer('');
+
+    let frame = 0;
+    const timer = setInterval(() => {
+      frame += 5;
+      const nextText = aiAnswer.slice(0, frame);
+      setDisplayedAiAnswer(nextText);
+
+      if (nextText.length >= aiAnswer.length) {
+        clearInterval(timer);
+      }
+    }, 16);
+
+    return () => clearInterval(timer);
+  }, [aiAnswer]);
+
+  useEffect(() => {
+    if (!aiAnswerHighlighted) {
+      return;
+    }
+
+    const highlightTimer = setTimeout(() => {
+      setAiAnswerHighlighted(false);
+    }, 2600);
+
+    return () => clearTimeout(highlightTimer);
+  }, [aiAnswerHighlighted]);
   const activeParticipations = participations.filter(
     (item) => item.status === 'joined' || item.status === 'accepted' || item.status === 'completed',
   );
@@ -888,8 +976,33 @@ export default function EventsFeedScreen({
     setSelectedAiEvent(event);
     setAiQuestion('');
     setAiAnswer('');
+    setDisplayedAiAnswer('');
     setAiAnswerError(null);
+    setAiAnswerHighlighted(false);
     setShowAiQuestionModal(true);
+  };
+
+  const handleOpenMenu = () => {
+    setShowMenuDrawer(true);
+    onOpenMenu?.();
+  };
+
+  const handleLogout = async () => {
+    if (isLoggingOut) {
+      return;
+    }
+
+    setIsLoggingOut(true);
+    setError(null);
+
+    try {
+      await logout();
+      setShowMenuDrawer(false);
+    } catch (logoutError) {
+      setError(logoutError instanceof Error ? logoutError.message : 'Не удалось выйти из аккаунта.');
+    } finally {
+      setIsLoggingOut(false);
+    }
   };
 
   const handleAskEventQuestion = async () => {
@@ -904,11 +1017,13 @@ export default function EventsFeedScreen({
 
     setIsAiAnswering(true);
     setAiAnswer('');
+    setDisplayedAiAnswer('');
     setAiAnswerError(null);
 
     try {
       const answer = await answerEventQuestion(selectedAiEvent, aiQuestion);
       setAiAnswer(answer);
+      setAiAnswerHighlighted(true);
     } catch (serviceError) {
       setAiAnswerError(
         serviceError instanceof Error
@@ -939,7 +1054,7 @@ export default function EventsFeedScreen({
           ) : null}
         </Pressable>
         <Pressable
-          onPress={onOpenMenu}
+          onPress={handleOpenMenu}
           style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
         >
           <MenuIcon />
@@ -1223,7 +1338,7 @@ export default function EventsFeedScreen({
       <VolunteerProfileScreen
         activeTab="profile"
         embedded
-        onOpenMenu={onOpenMenu}
+        onOpenMenu={handleOpenMenu}
         onOpenNotifications={() => void openNotificationCenter()}
         showBottomBar={false}
       />
@@ -1776,6 +1891,44 @@ export default function EventsFeedScreen({
     </Modal>
   );
 
+  const renderMenuDrawer = () => (
+    <Modal
+      animationType="fade"
+      onRequestClose={() => setShowMenuDrawer(false)}
+      transparent
+      visible={showMenuDrawer}
+    >
+      <View style={styles.menuDrawerOverlay}>
+        <Pressable
+          onPress={() => setShowMenuDrawer(false)}
+          style={styles.menuDrawerBackdrop}
+        />
+
+        <View style={styles.menuDrawerPanel}>
+          <View style={styles.menuDrawerHandle} />
+          <Text style={styles.menuDrawerTitle}>Меню</Text>
+          <Text style={styles.menuDrawerSubtitle}>Здесь только быстрый выход из аккаунта.</Text>
+
+          <Pressable
+            disabled={isLoggingOut}
+            onPress={() => void handleLogout()}
+            style={({ pressed }) => [
+              styles.menuDrawerLogoutButton,
+              isLoggingOut && styles.menuDrawerLogoutButtonDisabled,
+              pressed && !isLoggingOut && styles.pressed,
+            ]}
+          >
+            {isLoggingOut ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <Text style={styles.menuDrawerLogoutText}>Выйти из аккаунта</Text>
+            )}
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+
   const renderAiQuestionModal = () => (
     <Modal
       animationType="fade"
@@ -1811,6 +1964,7 @@ export default function EventsFeedScreen({
             </View>
 
             <ScrollView
+              ref={aiModalScrollRef}
               contentContainerStyle={styles.aiSheetScrollContent}
               keyboardDismissMode="interactive"
               keyboardShouldPersistTaps="handled"
@@ -1851,12 +2005,24 @@ export default function EventsFeedScreen({
                 </Pressable>
               </View>
 
-              <View style={styles.aiAnswerCard}>
+              <View style={[styles.aiAnswerCard, aiAnswerHighlighted && styles.aiAnswerCardHighlighted]}>
+                {aiAnswer ? (
+                  <View style={styles.aiAnswerBadge}>
+                    <Text style={styles.aiAnswerBadgeText}>Новый ответ AI</Text>
+                  </View>
+                ) : null}
                 <Text style={styles.aiAnswerTitle}>Ответ</Text>
-                <Text style={styles.aiAnswerBody}>
-                  {aiAnswer ||
-                    'AI ответит только на основе данных выбранного события. Если информации нет, он честно сообщит об этом.'}
-                </Text>
+                {isAiAnswering ? (
+                  <View style={styles.aiAnswerLoadingRow}>
+                    <ActivityIndicator color="#3650E8" size="small" />
+                    <Text style={styles.aiAnswerLoadingText}>AI готовит ответ...</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.aiAnswerBody}>
+                    {displayedAiAnswer ||
+                      'AI ответит только на основе данных выбранного события. Если информации нет, он честно сообщит об этом.'}
+                  </Text>
+                )}
               </View>
             </ScrollView>
           </View>
@@ -1873,14 +2039,6 @@ export default function EventsFeedScreen({
         renderEmptyState()
       ) : currentMatchEvent ? (
         <>
-          <View style={styles.matchDeckHeaderCard}>
-            <View style={styles.matchDeckProgressPill}>
-              <Text style={styles.matchDeckProgressText}>
-                {seenMatchCount + 1} из {recommendedEvents.length}
-              </Text>
-            </View>
-          </View>
-
           {renderEventCard({ item: currentMatchEvent })}
 
           <View style={styles.matchDecisionRow}>
@@ -1950,7 +2108,7 @@ export default function EventsFeedScreen({
       <OrganizationProfileScreen
         embedded
         onOpenEventsHub={() => setActiveTab('saved')}
-        onOpenMenu={onOpenMenu}
+        onOpenMenu={handleOpenMenu}
         onOpenNotifications={() => void openNotificationCenter()}
       />
     ) : (
@@ -2013,6 +2171,7 @@ export default function EventsFeedScreen({
         ) : null}
       </View>
 
+      {renderMenuDrawer()}
       {renderAnnouncementCenter()}
       {renderAiQuestionModal()}
 
@@ -3105,6 +3264,64 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(18, 24, 47, 0.28)',
     justifyContent: 'flex-end',
   },
+  menuDrawerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(18, 24, 47, 0.24)',
+    justifyContent: 'flex-end',
+    flexDirection: 'row',
+  },
+  menuDrawerBackdrop: {
+    flex: 1,
+  },
+  menuDrawerPanel: {
+    width: '76%',
+    maxWidth: 340,
+    backgroundColor: '#FBFBF8',
+    paddingTop: 18,
+    paddingHorizontal: 20,
+    paddingBottom: 34,
+    shadowColor: '#1C244F',
+    shadowOffset: { width: -8, height: 0 },
+    shadowOpacity: 0.14,
+    shadowRadius: 28,
+    elevation: 14,
+  },
+  menuDrawerHandle: {
+    width: 54,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#D8DBE8',
+    alignSelf: 'center',
+    marginBottom: 24,
+  },
+  menuDrawerTitle: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#141A32',
+    marginBottom: 8,
+  },
+  menuDrawerSubtitle: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#6A738F',
+    marginBottom: 24,
+  },
+  menuDrawerLogoutButton: {
+    minHeight: 54,
+    borderRadius: 18,
+    backgroundColor: '#1F2E8E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  menuDrawerLogoutButtonDisabled: {
+    opacity: 0.76,
+  },
+  menuDrawerLogoutText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
   messageSheet: {
     borderTopLeftRadius: 30,
     borderTopRightRadius: 30,
@@ -3237,11 +3454,45 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 16,
   },
+  aiAnswerCardHighlighted: {
+    borderWidth: 1,
+    borderColor: '#DCE4FF',
+    backgroundColor: '#F7F9FF',
+    shadowColor: '#3249D6',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.12,
+    shadowRadius: 18,
+    elevation: 4,
+  },
+  aiAnswerBadge: {
+    alignSelf: 'flex-start',
+    marginBottom: 10,
+    borderRadius: 999,
+    backgroundColor: '#E9EEFF',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  aiAnswerBadgeText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#3450DE',
+  },
   aiAnswerTitle: {
     fontSize: 16,
     fontWeight: '800',
     color: '#141A32',
     marginBottom: 10,
+  },
+  aiAnswerLoadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  aiAnswerLoadingText: {
+    marginLeft: 8,
+    fontSize: 14,
+    lineHeight: 21,
+    color: '#425071',
+    fontWeight: '700',
   },
   aiAnswerBody: {
     fontSize: 14,
